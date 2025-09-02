@@ -1,0 +1,23 @@
+[package]
+name = "docs-server"
+edition = "2024"
+version = "1.0.0"
+authors = ["Rafael Bradley"]
+license = "MIT"
+description = "A minimal live-reload HTTP server for rustdoc."
+repository = "https://github.com/Nekidev/docs-server"
+
+[dependencies]
+axum = "0.8.4"
+log = "0.4.27"
+notify = "8.2.0"
+tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread"] }
+open = "5.3.2"
+clap = { version = "4.5.46", features = ["derive"] }
+tower-http = { version = "0.6.6", features = ["fs"] }
+cargo_metadata = "0.22.0"
+pretty-logging = "0.1.0"
+
+[[bin]]
+path = "src/main.rs"
+name = "docs"
