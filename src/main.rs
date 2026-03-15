@@ -16,10 +16,7 @@ use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "A minimal live-reload HTTP server for rustdoc."
-)]
+#[command(version, about = "A minimal live-reload HTTP server for rustdoc.")]
 struct Args {
     /// The path to the crate's root, the dir at which Cargo.toml is at
     #[arg(default_value_t = PathWrapper::new(PathBuf::from_str(".").unwrap()))]
@@ -36,6 +33,10 @@ struct Args {
     /// Open the documentation server on start.
     #[arg(short, long)]
     open: bool,
+
+    /// Also display private modules and items.
+    #[arg(short, long)]
+    with_private: bool,
 }
 
 #[derive(Clone)]
@@ -110,26 +111,43 @@ async fn main() {
             .expect("No package was specified and there was no root package either")
     }.clone();
 
-    let package_name = package.name.clone();
+    let package_name = package.name.clone().to_string();
 
     let target = package
         .targets
-        .iter().find(|&target| target.is_lib()).cloned()
-        .or(package.targets.iter().find(|&target| target.is_bin()).cloned())
+        .iter()
+        .find(|&target| target.is_lib())
+        .cloned()
+        .or(package
+            .targets
+            .iter()
+            .find(|&target| target.is_bin())
+            .cloned())
         .or(package.targets.first().cloned())
         .expect("This crate has no targets!");
 
     log::info!("Compiling documentation for `{package_name}`...");
 
+    let cargo_args = if args.with_private {
+        vec![
+            "doc".to_string(),
+            "--no-deps".to_string(),
+            "--document-private-items".to_string(),
+            "--package".to_string(),
+            package_name.clone(),
+        ]
+    } else {
+        vec![
+            "doc".to_string(),
+            "--no-deps".to_string(),
+            "--package".to_string(),
+            package_name.clone(),
+        ]
+    };
+
     Command::new("cargo")
         .current_dir(&*args.root)
-        .args([
-            "doc",
-            "--no-deps",
-            "--document-private-items",
-            "--package",
-            &package_name,
-        ])
+        .args(cargo_args.clone())
         .output()
         .expect("Failed to run `cargo doc`");
 
@@ -164,13 +182,7 @@ async fn main() {
 
                     Command::new("cargo")
                         .current_dir(&*root)
-                        .args([
-                            "doc",
-                            "--no-deps",
-                            "--document-private-items",
-                            "--package",
-                            &package_name,
-                        ])
+                        .args(cargo_args.clone())
                         .output()
                         .expect("Failed to run `cargo doc`");
                 }
