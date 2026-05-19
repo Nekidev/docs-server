@@ -1,19 +1,17 @@
-use std::{
-    error::Error,
-    fmt::{Display, Formatter},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    ops::{Deref, DerefMut},
-    path::{Path, PathBuf},
-    process::Command,
-    str::FromStr,
-};
+use std::error::Error;
+use std::fmt::Display;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use axum::{Router, response::Redirect, routing};
+use axum::response::Redirect;
+use axum::{Router, routing};
 use cargo_metadata::{MetadataCommand, Package, Target};
 use clap::Parser;
 use log::LevelFilter;
 use notify::{Event, EventKind, Watcher};
-use tokio::{fs, net::TcpListener};
+use tokio::fs;
+use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
 
 #[derive(Parser)]
@@ -50,45 +48,6 @@ struct Args {
     /// Also display private modules and items.
     #[arg(short, long)]
     with_private: bool,
-}
-
-#[derive(Clone)]
-struct PathWrapper {
-    path: PathBuf,
-}
-
-impl PathWrapper {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl FromStr for PathWrapper {
-    type Err = std::convert::Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self::new(PathBuf::from(s)))
-    }
-}
-
-impl Display for PathWrapper {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.path.display())
-    }
-}
-
-impl Deref for PathWrapper {
-    type Target = PathBuf;
-
-    fn deref(&self) -> &Self::Target {
-        &self.path
-    }
-}
-
-impl DerefMut for PathWrapper {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.path
-    }
 }
 
 fn split_once_last(s: &str, c: char) -> Option<(&str, &str)> {
