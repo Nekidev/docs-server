@@ -1,7 +1,7 @@
 [package]
 name = "docs-server"
 edition = "2024"
-version = "1.2.0"
+version = "1.2.1"
 authors = ["Rafael Bradley"]
 license = "MIT"
 description = "A minimal live-reload HTTP server for rustdoc."
