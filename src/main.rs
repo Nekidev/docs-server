@@ -46,7 +46,7 @@ struct Args {
     open: bool,
 
     /// Also display private modules and items.
-    #[arg(short, long)]
+    #[arg(short = 'r', long)]
     with_private: bool,
 }
 
