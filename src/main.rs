@@ -1,20 +1,22 @@
-use std::error::Error;
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use anyhow::Context;
 use axum::response::Redirect;
 use axum::{Router, routing};
-use cargo_metadata::{MetadataCommand, Package, Target};
+use cargo_metadata::{Metadata, MetadataCommand, Package, Target};
 use clap::Parser;
 use log::LevelFilter;
 use notify::{Event, EventKind, Watcher};
 use tokio::fs;
 use tokio::net::TcpListener;
+use tokio::sync::watch::{self, Receiver, Sender};
+use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
 
-#[derive(Parser)]
+#[derive(Parser, Clone, Debug)]
 #[command(version, about = "A minimal live-reload HTTP server for rustdoc.")]
 struct Args {
     /// The path to the crate's root, the dir at which Cargo.toml is at
@@ -50,30 +52,41 @@ struct Args {
     with_private: bool,
 }
 
-fn split_once_last(s: &str, c: char) -> Option<(&str, &str)> {
-    s.rfind(c).map(|idx| {
-        let (left, right) = s.split_at(idx);
-        (left, &right[c.len_utf8()..]) // skip the separator
-    })
-}
-
-/// Boots up a documentation server.
-///
-/// It compiles the crate's documentation and recompiles it automatically when the source code
-/// changes.
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-
     pretty_logging::init(LevelFilter::Trace, ["docs"]);
 
     log::info!("Getting cargo metadata...");
-
     let metadata = MetadataCommand::new()
         .current_dir(&args.root)
         .exec()
-        .expect("Failed to get cargo metadata");
+        .context("Failed to get cargo metadata.")?;
 
+    let packages = get_packages(&args, &metadata);
+    if packages.is_empty() {
+        anyhow::bail!(concat!(
+            "No packages of the ones specified were found! Make sure you've specified ",
+            "`--package`, `--workspace`, and `--exclude` properly."
+        ));
+    }
+
+    let package_names: Vec<_> = packages.iter().map(|v| format!("`{}`", v.name)).collect();
+    log::info!("Compiling documentation for {}...", list(&package_names));
+
+    let (changes_tx, changes_rx) = watch::channel(0usize);
+
+    let mut tasks = JoinSet::new();
+    tasks.spawn(server(args.clone(), packages.clone(), metadata.clone()));
+    tasks.spawn(watcher(args.clone(), packages.clone(), changes_tx));
+    tasks.spawn(compiler(args.clone(), packages.clone(), changes_rx));
+
+    tasks.join_next().await.unwrap()??;
+
+    Ok(())
+}
+
+fn get_packages(args: &Args, metadata: &Metadata) -> Vec<Package> {
     let mut packages = vec![];
 
     if args.workspace {
@@ -94,138 +107,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    if packages.is_empty() {
-        panic!(concat!(
-            "No packages of the ones specified were found! Make sure you've specified ",
-            "`--package`, `--workspace`, and `--exclude` properly."
-        ));
-    }
-
-    let Some(target) = find_ideal_target(&packages) else {
-        panic!("There was no target to make documentation for!");
-    };
-    let target = target.clone();
-
-    let package_names: Vec<_> = packages.iter().map(|v| format!("`{}`", v.name)).collect();
-
-    log::info!("Compiling documentation for {}...", list(&package_names));
-
-    let mut cargo_args = vec!["doc".to_string(), "--no-deps".to_string()];
-
-    for package in &packages {
-        cargo_args.append(&mut vec!["--package".to_string(), package.name.to_string()]);
-    }
-
-    if args.with_private {
-        cargo_args.push("--document-private-items".to_string());
-    }
-
-    Command::new("cargo")
-        .current_dir(&*args.root)
-        .args(cargo_args.clone())
-        .output()
-        .expect("Failed to run `cargo doc`");
-
-    let root = args.root.clone();
-    let root_canonical = fs::canonicalize(&root).await?;
-
-    tokio::spawn(async move {
-        let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
-
-        let mut watcher = notify::recommended_watcher(tx).expect("Failed to create watcher");
-
-        for package in &packages {
-            watcher
-                .watch(
-                    Path::new(&format!(
-                        "{}/src/",
-                        split_once_last(package.manifest_path.as_str(), '/')
-                            .unwrap()
-                            .0
-                    )),
-                    notify::RecursiveMode::Recursive,
-                )
-                .expect("Failed to watch src directory");
-        }
-
-        for res in rx {
-            match res {
-                Ok(event) => {
-                    match event.kind {
-                        EventKind::Create(_) => {
-                            for path in event.paths {
-                                let relative_path =
-                                    pathdiff::diff_paths(path, &root_canonical).unwrap();
-                                log::info!("{} created, recompiling...", relative_path.display());
-                            }
-                        }
-                        EventKind::Modify(_) => {
-                            for path in event.paths {
-                                let relative_path =
-                                    pathdiff::diff_paths(path, &root_canonical).unwrap();
-                                log::info!("{} changed, recompiling...", relative_path.display());
-                            }
-                        }
-                        EventKind::Remove(_) => {
-                            for path in event.paths {
-                                let relative_path =
-                                    pathdiff::diff_paths(path, &root_canonical).unwrap();
-                                log::info!("{} removed, recompiling...", relative_path.display());
-                            }
-                        }
-                        _ => continue,
-                    }
-
-                    Command::new("cargo")
-                        .current_dir(&*root)
-                        .args(cargo_args.clone())
-                        .output()
-                        .expect("Failed to run `cargo doc`");
-                }
-                Err(e) => {
-                    log::error!("Watch error: {e:?}");
-                }
-            }
-        }
-    });
-
-    log::info!("Starting documentation server on address {}...", args.bind);
-
-    let docs: Router<()> = Router::new()
-        .route(
-            "/",
-            routing::get(|| async move { Redirect::permanent(&format!("/{}/", target.name)) }),
-        )
-        .fallback_service(ServeDir::new(metadata.target_directory.join("doc")));
-
-    let openable_address = if args.bind.ip() == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
-        format!("http://localhost:{}", args.bind.port())
-    } else {
-        format!("http://{}/", args.bind)
-    };
-
-    let listener = TcpListener::bind(args.bind)
-        .await
-        .expect("Could not bind to address!");
-
-    log::info!("Documentation server is running on {openable_address}");
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, docs)
-            .await
-            .expect("Could not start documentation server!")
-    });
-
-    if args.open {
-        match open::that(openable_address) {
-            Ok(_) => log::info!("Opened documentation in browser!"),
-            Err(e) => log::error!("Failed to open documentation in browser: {e}"),
-        }
-    }
-
-    handle.await.expect("Documentation server task failed!");
-
-    Ok(())
+    packages
 }
 
 fn find_ideal_target(packages: &[Package]) -> Option<&Target> {
@@ -247,6 +129,7 @@ fn find_ideal_target(packages: &[Package]) -> Option<&Target> {
 
     None
 }
+
 /// Formats items into a human-readable list.
 ///
 /// For example,
@@ -284,4 +167,153 @@ where
     }
 
     string
+}
+
+async fn compiler(
+    args: Args,
+    packages: Vec<Package>,
+    mut changes_rx: Receiver<usize>,
+) -> anyhow::Result<()> {
+    loop {
+        Command::new("cargo")
+            .current_dir(&*args.root)
+            .args(get_cargo_args(&args, &packages))
+            .output()
+            .context("Failed to run `cargo doc`")?;
+
+        log::info!("Documentation has been compiled.");
+
+        changes_rx.changed().await?;
+        changes_rx.borrow_and_update();
+    }
+}
+
+fn get_cargo_args(args: &Args, packages: &[Package]) -> Vec<String> {
+    let mut cargo_args = vec!["doc".to_string(), "--no-deps".to_string()];
+
+    for package in packages {
+        cargo_args.append(&mut vec!["--package".to_string(), package.name.to_string()]);
+    }
+
+    if args.with_private {
+        cargo_args.push("--document-private-items".to_string());
+    }
+
+    cargo_args
+}
+
+async fn watcher(
+    args: Args,
+    packages: Vec<Package>,
+    changes_tx: Sender<usize>,
+) -> anyhow::Result<()> {
+    let root = args.root.clone();
+    let root_canonical = fs::canonicalize(&root).await?;
+
+    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
+    let mut watcher = notify::recommended_watcher(tx).expect("Failed to create watcher");
+
+    for package in &packages {
+        watcher
+            .watch(
+                Path::new(&format!(
+                    "{}/src/",
+                    package
+                        .manifest_path
+                        .parent()
+                        .context("Manifest path did not have a parent??? This is a bug.")?
+                )),
+                notify::RecursiveMode::Recursive,
+            )
+            .expect("Failed to watch src directory");
+    }
+
+    for res in rx {
+        match res {
+            Ok(event) => {
+                match event.kind {
+                    EventKind::Create(_) => {
+                        for path in event.paths {
+                            let relative_path =
+                                pathdiff::diff_paths(path, &root_canonical).unwrap();
+                            log::info!("{} created, recompiling...", relative_path.display());
+                        }
+                    }
+                    EventKind::Modify(_) => {
+                        for path in event.paths {
+                            let relative_path =
+                                pathdiff::diff_paths(path, &root_canonical).unwrap();
+                            log::info!("{} changed, recompiling...", relative_path.display());
+                        }
+                    }
+                    EventKind::Remove(_) => {
+                        for path in event.paths {
+                            let relative_path =
+                                pathdiff::diff_paths(path, &root_canonical).unwrap();
+                            log::info!("{} removed, recompiling...", relative_path.display());
+                        }
+                    }
+                    _ => continue,
+                }
+
+                changes_tx.send_modify(|i| *i += 1);
+            }
+            Err(e) => {
+                log::error!("Watch error: {e:?}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn server(args: Args, packages: Vec<Package>, metadata: Metadata) -> anyhow::Result<()> {
+    let target = find_ideal_target(&packages)
+        .context("There was no target to make documentation for!")?
+        .clone();
+
+    log::info!("Starting documentation server on address {}...", args.bind);
+
+    let docs: Router<()> = get_router(target, &metadata);
+    let address = get_url(&args);
+
+    let listener = TcpListener::bind(args.bind)
+        .await
+        .context("Could not bind to address!")?;
+
+    log::info!("Documentation server is running on {address}");
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, docs)
+            .await
+            .context("Could not start documentation server!")
+    });
+
+    if args.open {
+        match open::that(address) {
+            Ok(_) => log::info!("Opened documentation in browser!"),
+            Err(e) => log::error!("Failed to open documentation in browser: {e}"),
+        }
+    }
+
+    handle.await.context("Documentation server task panicked!")??;
+
+    Ok(())
+}
+
+fn get_router(target: Target, metadata: &Metadata) -> Router {
+    Router::new()
+        .route(
+            "/",
+            routing::get(|| async move { Redirect::temporary(&format!("/{}/", target.name)) }),
+        )
+        .fallback_service(ServeDir::new(metadata.target_directory.join("doc")))
+}
+
+fn get_url(args: &Args) -> String {
+    if args.bind.ip() == IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)) {
+        format!("http://localhost:{}", args.bind.port())
+    } else {
+        format!("http://{}/", args.bind)
+    }
 }
