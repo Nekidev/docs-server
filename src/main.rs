@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::Context;
 use axum::response::Redirect;
@@ -9,9 +8,11 @@ use axum::{Router, routing};
 use cargo_metadata::{Metadata, MetadataCommand, Package, Target};
 use clap::Parser;
 use log::LevelFilter;
-use notify::{Event, EventKind, Watcher};
+use notify::{EventKind, Watcher};
 use tokio::fs;
 use tokio::net::TcpListener;
+use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::sync::watch::{self, Receiver, Sender};
 use tokio::task::JoinSet;
 use tower_http::services::ServeDir;
@@ -81,7 +82,17 @@ async fn main() -> anyhow::Result<()> {
     tasks.spawn(watcher(args.clone(), packages.clone(), changes_tx));
     tasks.spawn(compiler(args.clone(), packages.clone(), changes_rx));
 
-    tasks.join_next().await.unwrap()??;
+    if let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(result) => match result {
+                Ok(()) => log::error!("TASK ENDED UNEXPECTEDLY."),
+                Err(error) => log::error!("{error}"),
+            },
+            Err(error) => {
+                log::error!("{error}");
+            }
+        }
+    }
 
     Ok(())
 }
@@ -151,7 +162,7 @@ where
 
     for (i, item) in items.iter().enumerate() {
         let is_first = i == 0;
-        let is_penultimate = i == items.len() - 2;
+        let is_penultimate = items.len() >= 2 && i == items.len() - 2;
         let is_last = i == items.len() - 1;
 
         match (is_first, is_penultimate, is_last) {
@@ -179,9 +190,8 @@ async fn compiler(
             .current_dir(&*args.root)
             .args(get_cargo_args(&args, &packages))
             .output()
+            .await
             .context("Failed to run `cargo doc`")?;
-
-        log::info!("Documentation has been compiled.");
 
         changes_rx.changed().await?;
     }
@@ -209,8 +219,11 @@ async fn watcher(
     let root = args.root.clone();
     let root_canonical = fs::canonicalize(&root).await?;
 
-    let (tx, rx) = std::sync::mpsc::channel::<notify::Result<Event>>();
-    let mut watcher = notify::recommended_watcher(tx).expect("Failed to create watcher");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut watcher = notify::recommended_watcher(move |event| {
+        let _ = tx.send(event);
+    })
+    .context("Failed to create watcher.")?;
 
     for package in &packages {
         watcher
@@ -227,7 +240,7 @@ async fn watcher(
             .expect("Failed to watch src directory");
     }
 
-    for res in rx {
+    while let Some(res) = rx.recv().await {
         match res {
             Ok(event) => {
                 match event.kind {
@@ -255,7 +268,7 @@ async fn watcher(
                     _ => continue,
                 }
 
-                changes_tx.send_modify(|i| *i += 1);
+                let _ = changes_tx.send(9);
             }
             Err(e) => {
                 log::error!("Watch error: {e:?}");
@@ -295,7 +308,9 @@ async fn server(args: Args, packages: Vec<Package>, metadata: Metadata) -> anyho
         }
     }
 
-    handle.await.context("Documentation server task panicked!")??;
+    handle
+        .await
+        .context("Documentation server task panicked!")??;
 
     Ok(())
 }
