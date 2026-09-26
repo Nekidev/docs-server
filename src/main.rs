@@ -184,7 +184,6 @@ async fn compiler(
         log::info!("Documentation has been compiled.");
 
         changes_rx.changed().await?;
-        changes_rx.borrow_and_update();
     }
 }
 
